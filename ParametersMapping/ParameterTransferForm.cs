@@ -1,8 +1,11 @@
-﻿using Autodesk.Revit.DB;
+﻿using Autodesk.Revit.Attributes;
+using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
+using RevitLogger;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Reflection.Emit;
 using System.Windows.Forms;
@@ -33,6 +36,7 @@ namespace ParameterTransfer
         public string TargetParameterName => CmbTarget.Text?.Trim();
         public bool OverwriteExisting => ChkOverwrite.Checked;
 
+        private bool _isFiltering = false;
         public ParameterTransferForm(List<string> parameterNames)
         {
             _allParameterNames = parameterNames ?? new List<string>();
@@ -119,11 +123,11 @@ namespace ParameterTransfer
             var cmb = new ComboBox
             {
                 Dock = DockStyle.Fill,
-                AutoCompleteMode = AutoCompleteMode.SuggestAppend,
-                AutoCompleteSource = AutoCompleteSource.CustomSource,
+                DropDownStyle = ComboBoxStyle.DropDown,
                 Margin = new Padding(3)
             };
-            cmb.AutoCompleteCustomSource.AddRange(_allParameterNames.ToArray());
+            // Отключаем стандартный AutoComplete, т.к. делаем собственную фильтрацию по вхождению
+            cmb.AutoCompleteMode = AutoCompleteMode.None;
             cmb.Items.AddRange(_allParameterNames.ToArray());
             cmb.TextChanged += (s, e) => FilterComboBox(cmb);
             return cmb;
@@ -143,34 +147,49 @@ namespace ParameterTransfer
 
         /// <summary>
         /// Фильтрует выпадающий список по вхождению подстроки.
+        /// Список не открывается автоматически, чтобы не пропадал курсор мыши.
         /// </summary>
         private void FilterComboBox(ComboBox cmb)
         {
-            var text = cmb.Text;
-            cmb.BeginUpdate();
+            if (_isFiltering) return;
+            _isFiltering = true;
+
             try
             {
+                // Сохраняем состояние ДО изменения коллекции
+                string currentText = cmb.Text;
+                int cursorPos = cmb.SelectionStart;
+
+                cmb.BeginUpdate();
                 cmb.Items.Clear();
-                if (string.IsNullOrWhiteSpace(text))
+
+                if (string.IsNullOrWhiteSpace(currentText))
                 {
                     cmb.Items.AddRange(_allParameterNames.ToArray());
                 }
                 else
                 {
                     var filtered = _allParameterNames
-                        .Where(n => n.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0)
+                        .Where(n => n.IndexOf(currentText, StringComparison.OrdinalIgnoreCase) >= 0)
                         .ToArray();
                     cmb.Items.AddRange(filtered);
                 }
-                cmb.DroppedDown = cmb.Items.Count > 0 && cmb.Items.Count < _allParameterNames.Count;
+
+                cmb.EndUpdate();
+
+                // Восстанавливаем текст и курсор ввода
+                cmb.Text = currentText;
+                cmb.SelectionStart = cursorPos;
+                cmb.SelectionLength = 0;
+
+                // Список обновлён, но НЕ открывается автоматически.
+                // Пользователь откроет его кликом или стрелкой вниз.
+                // Это полностью решает проблему исчезновения курсора мыши.
             }
             finally
             {
-                cmb.EndUpdate();
+                _isFiltering = false;
             }
-
-            // Восстанавливаем позицию курсора, т.к. Items.Clear может её сбросить
-            cmb.SelectionStart = cmb.Text.Length;
         }
 
         private void BtnRun_Click(object sender, EventArgs e)
