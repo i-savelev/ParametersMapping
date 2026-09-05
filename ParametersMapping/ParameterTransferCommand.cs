@@ -1,9 +1,8 @@
-﻿
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection; // Добавлено для Reflection
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
@@ -11,6 +10,54 @@ using RevitLogger;
 
 namespace ParameterTransfer
 {
+    /// <summary>
+    /// Расширения для безопасного получения ID элемента в любой версии Revit.
+    /// </summary>
+    public static class ElementIdExtensions
+    {
+        private static PropertyInfo _valueProp;
+        private static PropertyInfo _intProp;
+        private static bool _initialized = false;
+        private static readonly object _lock = new object();
+
+        private static void Initialize(Type idType)
+        {
+            if (_initialized) return;
+            lock (_lock)
+            {
+                if (_initialized) return;
+                // Ищем свойство Value (Revit 2024+, long)
+                _valueProp = idType.GetProperty("Value");
+                // Ищем свойство IntegerValue (Revit <= 2023, int)
+                _intProp = idType.GetProperty("IntegerValue");
+                _initialized = true;
+            }
+        }
+
+        public static long GetIdValue(this ElementId id)
+        {
+            if (id == null) return -1;
+
+            Initialize(id.GetType());
+
+            if (_valueProp != null)
+            {
+                var val = _valueProp.GetValue(id);
+                if (val is long l) return l;
+                if (val is int i) return i;
+            }
+
+            if (_intProp != null)
+            {
+                var val = _intProp.GetValue(id);
+                if (val is int i) return i;
+            }
+
+            // Fallback на случай непредвиденных изменений API
+            return id.GetHashCode();
+        }
+    }
+
     /// <summary>
     /// Переносит значения из одного параметра в другой для всех элементов активного вида.
     /// Поддерживает пары Instance/Type в любой комбинации.
@@ -94,14 +141,10 @@ namespace ParameterTransfer
                 hasActiveDocument: commandData.Application.ActiveUIDocument != null);
         }
 
-        /// <summary>
-        /// Собирает уникальные имена всех параметров (ФОП и системных) в документе.
-        /// </summary>
         private List<string> CollectParameterNames(Document doc)
         {
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Связанные параметры (ФОП)
             var bindings = doc.ParameterBindings;
             if (bindings != null)
             {
@@ -114,7 +157,6 @@ namespace ParameterTransfer
                 }
             }
 
-            // Параметры категорий (системные и проектные)
             foreach (Category cat in doc.Settings.Categories)
             {
                 try
@@ -139,9 +181,6 @@ namespace ParameterTransfer
             return names.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
         }
 
-        /// <summary>
-        /// Выполняет перенос значений с подробной диагностикой каждого шага.
-        /// </summary>
         private void RunTransfer(Document doc, View activeView, string sourceName, string targetName, bool overwrite)
         {
             var elements = new FilteredElementCollector(doc, activeView.Id)
@@ -151,7 +190,7 @@ namespace ParameterTransfer
             Logger.Info($"[ParameterTransfer] Найдено экземпляров на виде: {elements.Count}");
             foreach (var e in elements)
             {
-                Logger.Debug($"[ParameterTransfer] Элемент на виде: Id={e.Id.Value}, Class={e.GetType().Name}, Name={e.Name}, TypeId={e.GetTypeId().Value}");
+                Logger.Debug($"[ParameterTransfer] Элемент на виде: Id={e.Id.GetIdValue()}, Class={e.GetType().Name}, Name={e.Name}, TypeId={e.GetTypeId().GetIdValue()}");
             }
 
             if (elements.Count == 0)
@@ -178,26 +217,25 @@ namespace ParameterTransfer
                     var groupElements = group.ToList();
                     var elementType = typeId != ElementId.InvalidElementId ? doc.GetElement(typeId) : null;
 
-                    Logger.Debug($"[ParameterTransfer] --- Группа типа Id={typeId.Value}, Name={elementType?.Name ?? "null"}, Экземпляров={groupElements.Count}");
+                    Logger.Debug($"[ParameterTransfer] --- Группа типа Id={typeId.GetIdValue()}, Name={elementType?.Name ?? "null"}, Экземпляров={groupElements.Count}");
 
-                    // Instance → Instance и Type → Instance
                     foreach (var elem in groupElements)
                     {
                         var (srcLoc, srcParam) = GetParameterLocation(elem, sourceName);
                         var (tgtLoc, tgtParam) = GetParameterLocation(elem, targetName);
 
-                        Logger.Debug($"[ParameterTransfer] Элемент Id={elem.Id.Value}: SrcLoc={srcLoc}, SrcParamId={srcParam?.Id.Value ?? -1}, TgtLoc={tgtLoc}, TgtParamId={tgtParam?.Id.Value ?? -1}");
+                        Logger.Debug($"[ParameterTransfer] Элемент Id={elem.Id.GetIdValue()}: SrcLoc={srcLoc}, SrcParamId={srcParam?.Id.GetIdValue() ?? -1}, TgtLoc={tgtLoc}, TgtParamId={tgtParam?.Id.GetIdValue() ?? -1}");
 
                         if (srcLoc == ParamLocation.Instance && tgtLoc == ParamLocation.Instance)
                         {
-                            Logger.Debug($"[ParameterTransfer] Сценарий Instance→Instance для элемента {elem.Id.Value}");
+                            Logger.Debug($"[ParameterTransfer] Сценарий Instance→Instance для элемента {elem.Id.GetIdValue()}");
                             if (CopyParameter(srcParam, tgtParam, overwrite)) copiedCount++;
                             else skippedCount++;
                         }
                         else if (srcLoc == ParamLocation.Type && tgtLoc == ParamLocation.Instance && elementType != null)
                         {
                             var srcTypeParam = elementType.LookupParameter(sourceName);
-                            Logger.Debug($"[ParameterTransfer] Сценарий Type→Instance для элемента {elem.Id.Value}, SrcTypeParamId={srcTypeParam?.Id.Value ?? -1}");
+                            Logger.Debug($"[ParameterTransfer] Сценарий Type→Instance для элемента {elem.Id.GetIdValue()}, SrcTypeParamId={srcTypeParam?.Id.GetIdValue() ?? -1}");
                             if (srcTypeParam != null)
                             {
                                 if (CopyParameter(srcTypeParam, tgtParam, overwrite)) copiedCount++;
@@ -207,11 +245,10 @@ namespace ParameterTransfer
                         }
                     }
 
-                    // Instance → Type
                     if (typeId != ElementId.InvalidElementId && elementType != null)
                     {
                         var tgtTypeParam = elementType.LookupParameter(targetName);
-                        Logger.Debug($"[ParameterTransfer] Проверка Instance→Type для типа {typeId.Value}, TgtTypeParamId={tgtTypeParam?.Id.Value ?? -1}");
+                        Logger.Debug($"[ParameterTransfer] Проверка Instance→Type для типа {typeId.GetIdValue()}, TgtTypeParamId={tgtTypeParam?.Id.GetIdValue() ?? -1}");
 
                         if (tgtTypeParam != null)
                         {
@@ -223,11 +260,11 @@ namespace ParameterTransfer
                                 {
                                     var vs = p.AsValueString() ?? p.AsString() ?? "";
                                     instanceSourceValues.Add(vs);
-                                    Logger.Debug($"[ParameterTransfer] Instance→Type: экземпляр {elem.Id.Value} имеет значение '{vs}'");
+                                    Logger.Debug($"[ParameterTransfer] Instance→Type: экземпляр {elem.Id.GetIdValue()} имеет значение '{vs}'");
                                 }
                                 else
                                 {
-                                    Logger.Debug($"[ParameterTransfer] Instance→Type: у экземпляра {elem.Id.Value} нет исходного параметра на уровне экземпляра");
+                                    Logger.Debug($"[ParameterTransfer] Instance→Type: у экземпляра {elem.Id.GetIdValue()} нет исходного параметра на уровне экземпляра");
                                 }
                             }
 
@@ -243,7 +280,7 @@ namespace ParameterTransfer
                                 {
                                     newValue = "Разные значения";
                                     diffValuesCount++;
-                                    Logger.Warning($"[ParameterTransfer] Тип '{elementType.Name}' (Id={typeId.Value}): у экземпляров разные значения, записано '{newValue}'. Уникальные значения: [{string.Join(", ", instanceSourceValues)}]");
+                                    Logger.Warning($"[ParameterTransfer] Тип '{elementType.Name}' (Id={typeId.GetIdValue()}): у экземпляров разные значения, записано '{newValue}'. Уникальные значения: [{string.Join(", ", instanceSourceValues)}]");
                                 }
 
                                 if (SetParameterValueFromString(tgtTypeParam, newValue, overwrite))
@@ -253,12 +290,11 @@ namespace ParameterTransfer
                             }
                             else
                             {
-                                Logger.Debug($"[ParameterTransfer] Instance→Type: ни у одного экземпляра типа {typeId.Value} нет исходного параметра на уровне экземпляра");
+                                Logger.Debug($"[ParameterTransfer] Instance→Type: ни у одного экземпляра типа {typeId.GetIdValue()} нет исходного параметра на уровне экземпляра");
                             }
                         }
                     }
 
-                    // Type → Type
                     if (typeId != ElementId.InvalidElementId && elementType != null)
                     {
                         var srcTypeParam = elementType.LookupParameter(sourceName);
@@ -267,11 +303,11 @@ namespace ParameterTransfer
                         bool srcIsType = srcTypeParam != null && srcTypeParam.Element.Id == elementType.Id;
                         bool tgtIsType = tgtTypeParam != null && tgtTypeParam.Element.Id == elementType.Id;
 
-                        Logger.Debug($"[ParameterTransfer] Проверка Type→Type для типа {typeId.Value}: SrcIsType={srcIsType}, TgtIsType={tgtIsType}");
+                        Logger.Debug($"[ParameterTransfer] Проверка Type→Type для типа {typeId.GetIdValue()}: SrcIsType={srcIsType}, TgtIsType={tgtIsType}");
 
                         if (srcIsType && tgtIsType)
                         {
-                            Logger.Debug($"[ParameterTransfer] Сценарий Type→Type для типа {typeId.Value}");
+                            Logger.Debug($"[ParameterTransfer] Сценарий Type→Type для типа {typeId.GetIdValue()}");
                             if (CopyParameter(srcTypeParam, tgtTypeParam, overwrite))
                                 copiedCount++;
                             else
@@ -281,7 +317,6 @@ namespace ParameterTransfer
                 }
 
                 tx.Commit();
-                // Проверка сохранения после коммита
                 Logger.Debug("[ParameterTransfer] --- Проверка значений после коммита транзакции ---");
                 foreach (var group in groups)
                 {
@@ -294,7 +329,7 @@ namespace ParameterTransfer
                     if (tgtTypeParam != null && tgtTypeParam.Element.Id == elementType.Id)
                     {
                         var val = tgtTypeParam.AsValueString() ?? tgtTypeParam.AsString() ?? "";
-                        Logger.Debug($"[ParameterTransfer] После коммита: Тип Id={typeId.Value}, Name={elementType.Name}, Параметр='{targetName}', Значение='{val}'");
+                        Logger.Debug($"[ParameterTransfer] После коммита: Тип Id={typeId.GetIdValue()}, Name={elementType.Name}, Параметр='{targetName}', Значение='{val}'");
                     }
                 }
             }
@@ -308,16 +343,13 @@ namespace ParameterTransfer
 
         private enum ParamLocation { Instance, Type, NotFound }
 
-        /// <summary>
-        /// Определяет, где находится параметр: у экземпляра или у типа.
-        /// </summary>
         private (ParamLocation location, Parameter param) GetParameterLocation(Element element, string paramName)
         {
             var p = element.LookupParameter(paramName);
             if (p != null)
             {
                 bool isInstance = p.Element.Id == element.Id;
-                Logger.Debug($"[ParameterTransfer] LookupParameter('{paramName}') для элемента {element.Id.Value}: найден ParamId={p.Id.Value}, OwnerId={p.Element.Id.Value}, IsInstance={isInstance}");
+                Logger.Debug($"[ParameterTransfer] LookupParameter('{paramName}') для элемента {element.Id.GetIdValue()}: найден ParamId={p.Id.GetIdValue()}, OwnerId={p.Element.Id.GetIdValue()}, IsInstance={isInstance}");
                 if (isInstance)
                     return (ParamLocation.Instance, p);
             }
@@ -331,19 +363,16 @@ namespace ParameterTransfer
                     var tp = type.LookupParameter(paramName);
                     if (tp != null && tp.Element.Id == type.Id)
                     {
-                        Logger.Debug($"[ParameterTransfer] LookupParameter('{paramName}') для типа {typeId.Value}: найден ParamId={tp.Id.Value}, OwnerId={tp.Element.Id.Value}");
+                        Logger.Debug($"[ParameterTransfer] LookupParameter('{paramName}') для типа {typeId.GetIdValue()}: найден ParamId={tp.Id.GetIdValue()}, OwnerId={tp.Element.Id.GetIdValue()}");
                         return (ParamLocation.Type, tp);
                     }
                 }
             }
 
-            Logger.Debug($"[ParameterTransfer] Параметр '{paramName}' не найден ни у элемента {element.Id.Value}, ни у его типа");
+            Logger.Debug($"[ParameterTransfer] Параметр '{paramName}' не найден ни у элемента {element.Id.GetIdValue()}, ни у его типа");
             return (ParamLocation.NotFound, null);
         }
 
-        /// <summary>
-        /// Копирует значение из src в target. Учитывает флаг перезаписи.
-        /// </summary>
         private bool CopyParameter(Parameter src, Parameter target, bool overwrite)
         {
             if (src == null || target == null) return false;
@@ -356,7 +385,7 @@ namespace ParameterTransfer
             var valueString = src.AsValueString() ?? src.AsString();
             if (string.IsNullOrEmpty(valueString))
             {
-                Logger.Debug($"[ParameterTransfer] Исходное значение пусто, элемент {src.Element.Id.Value}, пропуск");
+                Logger.Debug($"[ParameterTransfer] Исходное значение пусто, элемент {src.Element.Id.GetIdValue()}, пропуск");
                 return false;
             }
 
@@ -373,26 +402,16 @@ namespace ParameterTransfer
             return SetParameterValueFromString(target, valueString, overwrite);
         }
 
-        /// <summary>
-        /// Устанавливает значение параметра через SetValueString.
-        /// </summary>
-        /// <summary>
-        /// Устанавливает значение параметра через SetValueString с проверкой результата.
-        /// </summary>
-        /// <summary>
-        /// Устанавливает значение параметра с учётом StorageType.
-        /// Для String использует Set(string), для остальных — SetValueString.
-        /// </summary>
         private bool SetParameterValueFromString(Parameter target, string valueString, bool overwrite)
         {
             if (target == null || target.IsReadOnly)
             {
-                Logger.Warning($"[ParameterTransfer] Пропуск записи: параметр null или ReadOnly. ParamId={target?.Id.Value ?? -1}");
+                Logger.Warning($"[ParameterTransfer] Пропуск записи: параметр null или ReadOnly. ParamId={target?.Id.GetIdValue() ?? -1}");
                 return false;
             }
 
             var beforeValue = target.AsValueString() ?? target.AsString() ?? "";
-            Logger.Debug($"[ParameterTransfer] До записи: ParamId={target.Id.Value}, OwnerId={target.Element.Id.Value}, StorageType={target.StorageType}, CurrentValue='{beforeValue}', NewValue='{valueString}'");
+            Logger.Debug($"[ParameterTransfer] До записи: ParamId={target.Id.GetIdValue()}, OwnerId={target.Element.Id.GetIdValue()}, StorageType={target.StorageType}, CurrentValue='{beforeValue}', NewValue='{valueString}'");
 
             try
             {
@@ -400,14 +419,12 @@ namespace ParameterTransfer
 
                 if (target.StorageType == StorageType.String)
                 {
-                    // Для строковых параметров используем прямой Set(string)
                     target.Set(valueString);
                     success = true;
                     Logger.Debug($"[ParameterTransfer] Использован Set(string) для StorageType.String");
                 }
                 else
                 {
-                    // Для остальных типов пробуем SetValueString
                     success = target.SetValueString(valueString);
                     Logger.Debug($"[ParameterTransfer] Использован SetValueString для StorageType.{target.StorageType}, returned={success}");
                 }
@@ -417,19 +434,18 @@ namespace ParameterTransfer
 
                 if (!success || afterValue != valueString)
                 {
-                    Logger.Warning($"[ParameterTransfer] Запись не удалась: ParamId={target.Id.Value}, Expected='{valueString}', Got='{afterValue}', Success={success}");
+                    Logger.Warning($"[ParameterTransfer] Запись не удалась: ParamId={target.Id.GetIdValue()}, Expected='{valueString}', Got='{afterValue}', Success={success}");
                     return false;
                 }
 
-                Logger.Debug($"[ParameterTransfer] Успешно записано '{valueString}' в параметр '{target.Definition.Name}' элемента {target.Element.Id.Value}");
+                Logger.Debug($"[ParameterTransfer] Успешно записано '{valueString}' в параметр '{target.Definition.Name}' элемента {target.Element.Id.GetIdValue()}");
                 return true;
             }
             catch (Exception ex)
             {
-                Logger.Exception(ex, $"[ParameterTransfer] Исключение при записи '{valueString}' в ParamId={target.Id.Value}");
+                Logger.Exception(ex, $"[ParameterTransfer] Исключение при записи '{valueString}' в ParamId={target.Id.GetIdValue()}");
                 return false;
             }
         }
     }
 }
-
