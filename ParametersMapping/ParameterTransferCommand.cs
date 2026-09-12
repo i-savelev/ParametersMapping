@@ -67,8 +67,8 @@ namespace ParameterTransfer
     {
         public static string IS_TAB_NAME => "ISTools";
         public static string IS_NAME => "Перенос параметров";
-        public static string IS_IMAGE => "ParameterTransfer.Resources.transfer.png";
-        public static string IS_DESCRIPTION => "Перенос значений между параметрами элементов активного вида. Автор: PluginsManager";
+        public static string IS_IMAGE => "ParametersMapping.Resources.mapping.png";
+        public static string IS_DESCRIPTION => "Перенос значений между параметрами элементов активного вида";
 
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
